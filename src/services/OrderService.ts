@@ -2,9 +2,8 @@ import { IOrderRepository } from '../repositories/IOrderRepository';
 import { IPaymentMethod } from '../payments/IPaymentMethod';
 import { NotificationService } from './NotificationService';
 import { ProductFactory } from '../domain/ProductFactory';
-
-// Erro de validação (vira HTTP 400 no controller)
-export class OrderValidationError extends Error {}
+import { ValidationError } from '../lib/errors';
+import logger from '../lib/logger';
 
 export class OrderService {
   constructor(
@@ -14,11 +13,14 @@ export class OrderService {
   ) {}
 
   async processOrder(body: any) {
-    const { customer, items, paymentMethod, paymentDetails } = body;
+    const { customer, items, paymentMethod, paymentDetails } = body ?? {};
 
     // 1. Validação
-    if (!items || items.length === 0) {
-      throw new OrderValidationError('Carrinho vazio');
+    if (typeof customer !== 'string' || !customer.includes('@')) {
+      throw new ValidationError('E-mail do cliente inválido');
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new ValidationError('Carrinho vazio');
     }
 
     // 2. Cálculo do total
@@ -26,9 +28,13 @@ export class OrderService {
     const productsDetails = [];
 
     for (const item of items) {
+      if (!Number.isInteger(item?.productId) || !Number.isInteger(item?.quantity) || item.quantity <= 0) {
+        throw new ValidationError('Item inválido: informe productId e quantity (inteiro maior que zero)');
+      }
+
       const data = await this.orderRepository.findProductById(item.productId);
       if (!data) {
-        throw new OrderValidationError(`Produto ${item.productId} não encontrado`);
+        throw new ValidationError(`Produto ${item.productId} não encontrado`);
       }
 
       const product = ProductFactory.createProduct(data);
@@ -37,9 +43,9 @@ export class OrderService {
     }
 
     // 3. Pagamento
-    const payment = this.paymentMethods[paymentMethod];
+    const payment = Object.hasOwn(this.paymentMethods, paymentMethod) ? this.paymentMethods[paymentMethod] : undefined;
     if (!payment) {
-      throw new OrderValidationError('Método de pagamento não suportado');
+      throw new ValidationError('Método de pagamento não suportado');
     }
     payment.process(paymentDetails);
 
@@ -51,13 +57,18 @@ export class OrderService {
       status: 'confirmed',
     });
 
-    // 5. Notificação
-    const emailPreview = await this.notificationService.sendOrderConfirmation(
-      customer,
-      order.id,
-      totalAmount,
-      productsDetails.map(p => p.name)
-    );
+    // 5. Notificação: o pedido já foi salvo, então falha no e-mail não deve derrubar a requisição
+    let emailPreview: string | false = false;
+    try {
+      emailPreview = await this.notificationService.sendOrderConfirmation(
+        customer,
+        order.id,
+        totalAmount,
+        productsDetails.map(p => p.name)
+      );
+    } catch (error: any) {
+      logger.error(`Pedido #${order.id} salvo, mas falhou o envio do e-mail: ${error.message}`);
+    }
 
     return { orderId: order.id, emailPreview };
   }
